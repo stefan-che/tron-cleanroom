@@ -1,0 +1,4 @@
+# Secrets and build output - never commit
+/config.json
+/kek
+/encryptor

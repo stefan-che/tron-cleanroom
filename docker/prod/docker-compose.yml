@@ -1,0 +1,279 @@
+# Production compose for tron-telegram-api.
+# Run strictly from this directory: docker compose --env-file .env up -d
+#
+# Differences from the local docker/docker-compose.yml:
+#   * DB and Redis ports are not published outside; they live on the internal network;
+#   * php-fpm, queues and the scheduler run in separate containers;
+#   * code is mounted read-only; only storage and bootstrap/cache are writable;
+#   * opcache is on without revalidation; code reload is done via the USR2 signal (make deploy);
+#   * every service has resource limits, log rotation and a healthcheck.
+
+x-logging: &default-logging
+    driver: json-file
+    options:
+        max-size: "10m"
+        max-file: "5"
+
+# Shared part for all PHP containers (fpm, worker, scheduler, cli).
+x-php-common: &php-common
+    build:
+        context: .
+        dockerfile: ./images/php/Dockerfile
+        args:
+            PUID: ${PUID:-33}
+            PGID: ${PGID:-33}
+    image: tron-api-php:prod
+    restart: unless-stopped
+    # tini as PID 1. Without it PID 1 is php itself, and the kernel does not apply
+    # default signal actions to pid 1: a command without a SIGTERM
+    # handler (schedule:work installs none) simply ignores it, docker
+    # waits the full stop_grace_period and then sends SIGKILL. With tini, php is no
+    # longer the first process and exits on TERM immediately.
+    init: true
+    # env_file is intentionally NOT used here. Docker reads it only when the
+    # container is created and injects the values into the process environment, while Laravel
+    # loads .env via Dotenv::createImmutable, where an existing environment
+    # variable wins over the file. As a result, .env edits on the host would not
+    # apply until the container is recreated, even though the file is mounted and visible.
+    # The application reads /var/www/app/.env directly and needs no injection.
+    # Below is only what the container itself actually needs.
+    # ENCRYPTOR_KEK is not passed: the encryptor reads the KEK only from enc/kek
+    # (the env override in cleanroom-vault main.go is disabled on purpose).
+    environment:
+        PHP_MEMORY_LIMIT: '${PHP_MEMORY_LIMIT:-512M}'
+        PHP_OPCACHE_VALIDATE_TIMESTAMPS: '${PHP_OPCACHE_VALIDATE_TIMESTAMPS:-0}'
+    volumes:
+        # Code is read-only: the web process must not be able to rewrite itself.
+        - ${APP_PATH:-../..}:/var/www/app:ro
+        # Locations the application must be able to write to.
+        - ${APP_PATH:-../..}/storage:/var/www/app/storage:rw
+        - ${APP_PATH:-../..}/bootstrap/cache:/var/www/app/bootstrap/cache:rw
+        # vendor is writable only for composer install during deploy.
+        - ${APP_PATH:-../..}/vendor:/var/www/app/vendor:rw
+    depends_on:
+        app-mysql:
+            condition: service_healthy
+        app-redis:
+            condition: service_healthy
+    networks:
+        - backend
+        - egress
+    logging: *default-logging
+
+services:
+    app-nginx:
+        container_name: ${COMPOSE_PROJECT_NAME:-tron-prod}-nginx
+        build:
+            context: .
+            dockerfile: ./images/nginx/Dockerfile
+        image: tron-api-nginx:prod
+        restart: unless-stopped
+        environment:
+            APP_DOMAIN: '${APP_DOMAIN}'
+            PHP_UPSTREAM: 'app-php:9000'
+            CLIENT_MAX_BODY_SIZE: '${CLIENT_MAX_BODY_SIZE:-32m}'
+            NGINX_ENVSUBST_FILTER: '^(APP_DOMAIN|PHP_UPSTREAM|CLIENT_MAX_BODY_SIZE)$$'
+        volumes:
+            - ${APP_PATH:-../..}:/var/www/app:ro
+            - ./logs/nginx:/var/log/nginx
+        ports:
+            - "${HTTP_PORT:-80}:80"
+        depends_on:
+            app-php:
+                condition: service_healthy
+        networks:
+            - frontend
+            - backend
+        healthcheck:
+            # The alpine image has no curl; the healthcheck uses busybox wget.
+            test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 20s
+        deploy:
+            resources:
+                limits:
+                    cpus: '${NGINX_CPUS:-1}'
+                    memory: ${NGINX_MEMORY:-256M}
+        logging: *default-logging
+
+    app-php:
+        <<: *php-common
+        container_name: ${COMPOSE_PROJECT_NAME:-tron-prod}-php
+        command: ["php-fpm", "-F"]
+        healthcheck:
+            test: ["CMD", "php-fpm-healthcheck"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 20s
+        deploy:
+            resources:
+                limits:
+                    cpus: '${PHP_CPUS:-2}'
+                    memory: ${PHP_MEMORY:-2G}
+
+    app-queue:
+        <<: *php-common
+        container_name: ${COMPOSE_PROJECT_NAME:-tron-prod}-queue
+        command: ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]
+        environment:
+            PHP_MEMORY_LIMIT: '${PHP_MEMORY_LIMIT:-512M}'
+            PHP_OPCACHE_VALIDATE_TIMESTAMPS: '${PHP_OPCACHE_VALIDATE_TIMESTAMPS:-0}'
+            QUEUE_WORKERS: '${QUEUE_WORKERS:-2}'
+            QUEUE_TRIES: '${QUEUE_TRIES:-3}'
+            QUEUE_TIMEOUT: '${QUEUE_TIMEOUT:-300}'
+            QUEUE_MAX_JOBS: '${QUEUE_MAX_JOBS:-500}'
+            QUEUE_MAX_TIME: '${QUEUE_MAX_TIME:-3600}'
+        volumes:
+            - ${APP_PATH:-../..}:/var/www/app:ro
+            - ${APP_PATH:-../..}/storage:/var/www/app/storage:rw
+            - ${APP_PATH:-../..}/bootstrap/cache:/var/www/app/bootstrap/cache:rw
+            - ${APP_PATH:-../..}/vendor:/var/www/app/vendor:rw
+            - ./images/supervisor/supervisord.conf:/etc/supervisor/supervisord.conf:ro
+        healthcheck:
+            test: ["CMD-SHELL", "supervisorctl -c /etc/supervisor/supervisord.conf status worker:* | grep -q RUNNING"]
+            interval: 60s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+        stop_grace_period: 620s
+        deploy:
+            resources:
+                limits:
+                    cpus: '${QUEUE_CPUS:-2}'
+                    memory: ${QUEUE_MEMORY:-1G}
+
+    app-scheduler:
+        <<: *php-common
+        container_name: ${COMPOSE_PROJECT_NAME:-tron-prod}-scheduler
+        command: ["php", "artisan", "schedule:work", "--no-interaction"]
+        healthcheck:
+            test: ["CMD-SHELL", "pgrep -f 'artisan schedule:work' > /dev/null"]
+            interval: 60s
+            timeout: 5s
+            retries: 3
+            start_period: 30s
+        deploy:
+            resources:
+                limits:
+                    cpus: '${SCHEDULER_CPUS:-1}'
+                    memory: ${SCHEDULER_MEMORY:-512M}
+
+    app-mysql:
+        container_name: ${COMPOSE_PROJECT_NAME:-tron-prod}-mysql
+        # 8.4 LTS (images/mysql/Dockerfile), not 8.0.46: the 8.0 branch is end-of-life,
+        # no new builds will ship, and CVEs only piled up in the image (88
+        # critical/high). The 8.0 → 8.4 upgrade is in-place: data is
+        # upgraded on first start, but this directory can NOT be rolled back
+        # to 8.0 afterwards: `make backup` is mandatory before rollout.
+        build:
+            context: .
+            dockerfile: ./images/mysql/Dockerfile
+        image: tron-api-mysql:prod
+        ports:
+            # Only for manual access from the host (dumps, mysql client).
+            # The application and the encryptor do not need it: they reach
+            # app-mysql by name inside the backend network. If this access is not needed,
+            # remove this block and the dbaccess network below.
+            #
+            # The 127.0.0.1 prefix is mandatory: without it docker binds 0.0.0.0
+            # and the database becomes visible to the whole subnet, bypassing iptables: docker
+            # rules live in the DOCKER chain, which INPUT never reaches.
+            - "127.0.0.1:3306:3306"
+        restart: unless-stopped
+        command:
+            # In 8.4 the mysql_native_password plugin is not removed but disabled by
+            # default: without this flag, accounts created with it on 8.0
+            # can no longer log in (ERROR 1524 Plugin not loaded). It is used by
+            # enc_user (the encryptor's Go driver trips over caching_sha2 on an
+            # unencrypted connection, see README) and most likely by the
+            # application user.
+            #
+            # --authentication-policy is no longer set: new users
+            # get caching_sha2_password by default (PHP 8.4/mysqlnd supports
+            # it), and accounts that need native are created with an explicit
+            # IDENTIFIED WITH mysql_native_password, as in README.
+            #
+            # The flag goes away once all accounts are migrated:
+            #   SELECT user, host, plugin FROM mysql.user;
+            #   ALTER USER 'user'@'%' IDENTIFIED WITH caching_sha2_password BY '...';
+            # MySQL 9 does not have the plugin at all.
+            - --mysql-native-password=ON
+        environment:
+            MYSQL_DATABASE: '${DB_DATABASE}'
+            MYSQL_USER: '${DB_USERNAME}'
+            MYSQL_PASSWORD: '${DB_PASSWORD}'
+            MYSQL_ROOT_PASSWORD: '${DB_ROOT_PASSWORD}'
+            TZ: '${TZ:-UTC}'
+        volumes:
+            - ${MYSQL_DATA_PATH:-./data/mysql}:/var/lib/mysql
+            - ./images/mysql/my.cnf:/etc/mysql/conf.d/zz-prod.cnf:ro
+            - ./backups:/backups
+        networks:
+            - backend
+            # Only for publishing the port to the host, see dbaccess below.
+            - dbaccess
+        healthcheck:
+            # CMD-SHELL, not CMD: without a shell the variable is not expanded.
+            test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+            interval: 15s
+            timeout: 10s
+            retries: 10
+            start_period: 60s
+        deploy:
+            resources:
+                limits:
+                    cpus: '${MYSQL_CPUS:-2}'
+                    memory: ${MYSQL_MEMORY:-2G}
+        logging: *default-logging
+
+    app-redis:
+        container_name: ${COMPOSE_PROJECT_NAME:-tron-prod}-redis
+        build:
+            context: .
+            dockerfile: ./images/redis/Dockerfile
+        image: tron-api-redis:prod
+        restart: unless-stopped
+        command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${REDIS_PASSWORD}"]
+        volumes:
+            - ./images/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+            - ${REDIS_DATA_PATH:-./data/redis}:/data
+        networks:
+            - backend
+        healthcheck:
+            test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 10s
+        environment:
+            REDIS_PASSWORD: '${REDIS_PASSWORD}'
+        deploy:
+            resources:
+                limits:
+                    cpus: '${REDIS_CPUS:-1}'
+                    memory: ${REDIS_MEMORY:-512M}
+        logging: *default-logging
+
+networks:
+    # Public network: only nginx faces outside.
+    frontend:
+        driver: bridge
+    # Internal network without internet access: mysql, redis, php<->nginx.
+    backend:
+        driver: bridge
+        internal: true
+    # Outbound access for PHP (TRON API, Telegram, AML providers).
+    egress:
+        driver: bridge
+    # Needed only together with the mysql port published on loopback: backend
+    # is declared internal, and docker does not set up port publishing on isolated
+    # networks: the container runs, but 127.0.0.1:3306 on the host does not listen.
+    # This network exposes nothing outside: the port is bound to loopback, and NAT
+    # for outbound traffic is disabled, so mysql does not get internet access.
+    dbaccess:
+        driver: bridge
+        driver_opts:
+            com.docker.network.bridge.enable_ip_masquerade: "false"

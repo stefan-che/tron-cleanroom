@@ -1,0 +1,10 @@
+{
+  "_comment": "master_key / previous_keys: master key(s) wrapped with the KEK (output of ./encryptor wrap_key <plaintext-master-key>). connect1..connect5: MySQL DSNs encrypted with the master key (output of ./encryptor encrypt_bd \"user:pass@tcp(host:3306)/encryptor\"). The KEK itself is read from the file 'kek' next to the binary (chmod 600).",
+  "master_key": "<output of ./encryptor wrap_key for the current master key>",
+  "previous_keys": [],
+  "connect1": "<output of ./encryptor encrypt_bd for DSN #1>",
+  "connect2": "",
+  "connect3": "<output of ./encryptor encrypt_bd for the default DSN>",
+  "connect4": "",
+  "connect5": ""
+}

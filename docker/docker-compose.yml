@@ -1,0 +1,139 @@
+# Local / single-host stack for tron-cleanroom. Run from this directory (docker/).
+# Variables come from docker/.env (container settings), NOT from the Laravel .env.
+#
+# Published ports: HTTP_PORT / HTTPS_PORT (all interfaces) and *_PUBLISH_PORT for
+# MySQL, vault MySQL, Postgres, Redis (127.0.0.1 only). Override them in docker/.env, so the stack
+# coexists with cleanroom-watcher and anything else on the host.
+#
+# Shared network `processing-net` (external, create once: `make network`):
+#   * app-php   -> cleanroom-watcher API:   WALLET_LISTENER_SERVICE_URL=http://cleanroom-watcher:8080
+#   * cleanroom-watcher -> our webhook:     http://tron-cleanroom/webhook/wallet-listener
+#     (APP_URL must be an address the listener can reach, see docs/QUICKSTART.md)
+services:
+    app-nginx:
+        container_name: app-nginx
+        build:
+            context: .
+            dockerfile: ./images/nginx/Dockerfile
+            args:
+                ENVIRONMENT: ${ENVIRONMENT:-local}
+        volumes:
+            - ./images/nginx/nginx.conf:/etc/nginx/nginx.conf
+            - ../:/var/www/app
+            - ./logs/nginx:/var/log/nginx
+        depends_on:
+            - app-php
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        ports:
+            - "${HTTP_PORT:-80}:80"
+            - "${HTTPS_PORT:-443}:443"
+        networks:
+            tron-network:
+            processing-net:
+                aliases:
+                    - tron-cleanroom
+
+    app-php:
+        container_name: app-php
+        build: ./images/php
+        environment:
+            APP_DEBUG: 1
+            # No ENCRYPTOR_KEK here: the encryptor reads the KEK only from enc/kek
+            # (the env override in cleanroom-vault main.go is disabled on purpose).
+        volumes:
+            - ../:/var/www/app
+            - ./images/php/custom_php.ini:/usr/local/etc/php/conf.d/custom_php.ini
+            - ./images/supervisor/supervisord.conf:/etc/supervisor/supervisord.conf
+        depends_on:
+            app-mysql:
+                condition: service_healthy
+            app-mysql-key-storage:
+                condition: service_healthy
+        networks:
+            - tron-network
+            - processing-net
+
+    app-mysql:
+        container_name: app-mysql
+        image: mysql:8.4
+        # Same as prod: keeps accounts created on 8.0 (mysql_native_password) working.
+        command: ["--mysql-native-password=ON"]
+        volumes:
+            - ./data/mysql/:/var/lib/mysql
+        environment:
+            MYSQL_DATABASE: '${DB_DATABASE}'
+            MYSQL_ROOT_PASSWORD: '${DB_ROOT_PASSWORD}'
+            MYSQL_USER: '${DB_USERNAME}'
+            MYSQL_PASSWORD: '${DB_PASSWORD}'
+        ports:
+            - "127.0.0.1:${MYSQL_PUBLISH_PORT:-3306}:3306"
+        healthcheck:
+            test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+            interval: 5s
+            timeout: 5s
+            retries: 30
+            start_period: 30s
+        networks:
+            - tron-network
+
+    # Vault for the encryptor (cleanroom-vault): database `encryptor`, user `enc_user`.
+    # Created on the first start from the canonical ../cleanroom-vault/db.sql by
+    # images/mysql-key-storage/10-vault.sh (baked into the image); the password is
+    # DB_PASSWORD_KEY_STORAGE.
+    app-mysql-key-storage:
+        container_name: app-mysql-key-storage
+        build:
+            context: .
+            dockerfile: ./images/mysql-key-storage/Dockerfile
+        # enc_user uses mysql_native_password (Go driver + non-TLS), disabled by default in 8.4.
+        command: ["--mysql-native-password=ON"]
+        volumes:
+            - ./data/mysql-ks/:/var/lib/mysql
+            - ${ENCRYPTOR_SRC:-../../cleanroom-vault}/db.sql:/vault/db.sql:ro
+        environment:
+            MYSQL_ROOT_PASSWORD: '${DB_ROOT_PASSWORD}'
+            VAULT_DB_PASSWORD: '${DB_PASSWORD_KEY_STORAGE}'
+        ports:
+            - "127.0.0.1:${MYSQL_KS_PUBLISH_PORT:-3307}:3306"
+        healthcheck:
+            # Healthy only when the vault table exists: a failed first-start init otherwise
+            # leaves a running MySQL without the vault (initdb never re-runs on a non-empty dir).
+            test: ["CMD-SHELL", "mysql -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1 FROM encryptor.wallet_keys LIMIT 1' >/dev/null"]
+            interval: 5s
+            timeout: 5s
+            retries: 30
+            start_period: 30s
+        networks:
+            - tron-network
+
+    app-postgres:
+        container_name: app-postgres
+        image: postgres:16-alpine
+        volumes:
+            - ./data/postgres/:/var/lib/postgresql/data
+        environment:
+            POSTGRES_DB: '${DB_DATABASE}'
+            POSTGRES_USER: '${DB_USERNAME}'
+            POSTGRES_PASSWORD: '${DB_PASSWORD}'
+        ports:
+            - "127.0.0.1:${POSTGRES_PUBLISH_PORT:-5432}:5432"
+        networks:
+            - tron-network
+
+    app-redis:
+        image: redis:7.2-alpine
+        volumes:
+            - ./data/redis/data:/data
+        command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+        ports:
+            - "127.0.0.1:${REDIS_PUBLISH_PORT:-6380}:6379"
+        networks:
+            - tron-network
+
+networks:
+    tron-network:
+        driver: bridge
+    processing-net:
+        external: true
+        name: ${SHARED_NETWORK:-processing-net}

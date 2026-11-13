@@ -1,0 +1,165 @@
+# Application virtual host. ${APP_DOMAIN}, ${PHP_UPSTREAM} and
+# ${CLIENT_MAX_BODY_SIZE} are substituted by envsubst when the container starts.
+#
+# No TLS here: only port 80 is exposed, TLS is terminated by the front proxy.
+# Its subnet must be listed in /etc/nginx/geo/trusted-proxies.inc, otherwise
+# the application sees the proxy address instead of the client address.
+
+# php-fpm is resolved per request via docker DNS: nginx does not fail on start
+# if php is not up yet, and does not keep a stale IP after the container is recreated.
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+# --- Requests with a foreign Host: close without reaching the application ---
+server {
+    listen      80 default_server;
+    listen      [::]:80 default_server;
+    server_name _;
+
+    # Liveness check for the docker healthcheck: it hits 127.0.0.1,
+    # so it lands in exactly this server block.
+    location = /healthz {
+        access_log off;
+        include /etc/nginx/snippets/security-headers.inc;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    location / {
+        return 444;
+    }
+}
+
+# --- HTTP: application ---
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name ${APP_DOMAIN};
+
+    root  /var/www/app/public;
+    index index.php;
+
+    charset utf-8;
+    client_max_body_size ${CLIENT_MAX_BODY_SIZE};
+
+    access_log /var/log/nginx/access.log main buffer=64k flush=5s;
+    error_log  /var/log/nginx/error.log warn;
+
+    # --- Security headers ---
+    # Kept in a separate file and also included in every location that has its own
+    # add_header: when a location has add_header, nginx does not inherit
+    # the server-level ones. See the comment in security-headers.inc itself.
+    include /etc/nginx/snippets/security-headers.inc;
+
+    limit_conn perip 50;
+
+    # --- Static files ---
+    location ~* \.(?:js|css|png|jpe?g|gif|ico|webp|svg|woff2?|ttf|eot|map)$ {
+        expires    30d;
+        access_log off;
+        include /etc/nginx/snippets/security-headers.inc;
+        add_header Cache-Control "public, immutable";
+        try_files  $uri =404;
+    }
+
+    location = /healthz {
+        access_log off;
+        include /etc/nginx/snippets/security-headers.inc;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; try_files $uri =404; }
+    location = /robots.txt  { access_log off; log_not_found off; try_files $uri =404; }
+
+    # --- Endpoints that must not be exposed ---
+    # /fpm-status and /fpm-ping are not published through nginx at all: an allow list
+    # of private subnets would in practice let in the server's whole local
+    # network, and php-fpm status reveals script paths and active requests.
+    # Check the status from inside the container, over fastcgi:
+    #   docker compose exec app-php php-fpm-healthcheck
+    #   docker compose exec app-php sh -c 'SCRIPT_NAME=/fpm-status \
+    #       SCRIPT_FILENAME=/fpm-status REQUEST_METHOD=GET \
+    #       cgi-fcgi -bind -connect 127.0.0.1:9000'
+    location ~ ^/(fpm-status|fpm-ping)$ {
+        deny all;
+        access_log off;
+    }
+
+    # Dotfiles (.env, .git, etc.): denied outright.
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Directories that should not exist in public; if they do, they are not served.
+    # Note: do not add vendor here. Composer's vendor/ sits
+    # one level above root and is unreachable over http anyway, while
+    # public/vendor/ holds the published Orchid and Log Viewer assets,
+    # and denying it would break the admin panel.
+    location ~ ^/(storage/logs|docker|enc|tests)/ {
+        deny all;
+        access_log off;
+    }
+
+    # --- Rate limiting for sensitive endpoints ---
+    # Admin login form: password brute force.
+    location ~ ^/[^/]+/admin-login$ {
+        limit_req zone=login burst=5 nodelay;
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    # Telegram webhook and API: protection against request flooding.
+    location ~ ^/(api|telegram)/ {
+        limit_req zone=api burst=60 nodelay;
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    # --- PHP ---
+    # Single entry point: only index.php is executed. Any other .php
+    # in public (forgotten scripts, uploaded files) will not run.
+    location ~ ^/index\.php$ {
+        set $php_upstream "${PHP_UPSTREAM}";
+        fastcgi_pass  $php_upstream;
+        fastcgi_index index.php;
+
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT   $document_root;
+        include fastcgi_params;
+
+        # Both headers are ALWAYS overwritten, after
+        # include fastcgi_params, so the client value never reaches
+        # the application. $remote_addr here is either the address the connection
+        # actually came from, or the client IP substituted by the realip module
+        # for trusted proxies. See /etc/nginx/geo/trusted-proxies.inc.
+        fastcgi_param HTTP_CF_CONNECTING_IP $remote_addr;
+        fastcgi_param HTTP_X_FORWARDED_FOR  $remote_addr;
+
+        # Externally the site runs over https: TLS is terminated by the front proxy, and the
+        # connection reaches us already decrypted, on port 80. Without this
+        # flag PHP considers the request insecure, Laravel generates
+        # http links in form actions and redirects, and the browser complains about
+        # mixed content. There is no other path to nginx except through the proxy,
+        # so the flag is set unconditionally.
+        # If an honest http entry ever appears, replace this with a map on
+        # $http_x_forwarded_proto in nginx.conf and use the variable.
+        fastcgi_param HTTPS       on;
+        fastcgi_param SERVER_PORT 443;
+
+        fastcgi_connect_timeout 5s;
+        fastcgi_send_timeout    120s;
+        fastcgi_read_timeout    120s;
+        fastcgi_ignore_client_abort on;
+
+        fastcgi_keep_conn on;
+        fastcgi_hide_header X-Powered-By;
+    }
+
+    location ~ \.php$ {
+        deny all;
+    }
+}
